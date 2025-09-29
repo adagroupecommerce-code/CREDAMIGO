@@ -95,16 +95,10 @@ export interface Payment {
   amount: number;
   principalAmount?: number;
   interestAmount?: number;
-  penalty?: number;
   dueDate: string;
   paymentDate?: string;
   status: 'pending' | 'paid' | 'overdue';
-  originalAmount?: number;
-  paymentType?: 'full' | 'partial' | 'overpayment';
-  excessAmount?: number;
-  notes?: string;
-  clientName?: string;
-  clientId?: string;
+  penalty?: number;
 }
 
 export interface Dashboard {

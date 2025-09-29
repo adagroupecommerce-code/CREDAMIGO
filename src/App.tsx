@@ -523,9 +523,10 @@ function App() {
           <RBACProtectedRoute resource={RBAC_RESOURCES.COLLECTIONS} action={RBAC_ACTIONS.READ}>
             <BillingDashboard 
               onViewPayment={handleViewPayment}
-              onUpdateLoan={handleUpdateLoan}
               onDeletePayment={(paymentId) => {
+                // Aqui você removeria o pagamento do estado global
                 console.log('Excluindo pagamento:', paymentId);
+                // Em produção, fazer chamada para API/banco de dados
               }}
             />
           </RBACProtectedRoute>

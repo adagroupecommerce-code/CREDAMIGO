@@ -1,10 +1,8 @@
 import React from 'react';
 import { ArrowLeft, Calendar, DollarSign, User, Clock, CheckCircle, XCircle, AlertTriangle, TrendingUp, Calculator, CreditCard as Edit, Save, X, CreditCard } from 'lucide-react';
 import { Loan } from '../types';
-import { processPayment, calculateCapitalInterestMetrics, PaymentData } from '../utils/paymentUtils';
-import { generateRealTimePayments, calculatePenalty, syncPaymentsFromLoan } from '../utils/paymentSync';
-import { useClients } from '../hooks/useClients';
-import { usePayments } from '../hooks/usePayments';
+import { mockClients } from '../data/mockData';
+import { generatePaymentsFromLoan, calculateCapitalInterestMetrics, processPayment, validatePaymentData, PaymentData, PaymentProcessResult } from '../utils/paymentUtils';
 import { useRBAC } from '../hooks/useRBAC';
 import { RBAC_RESOURCES, RBAC_ACTIONS } from '../types/rbac';
 import RBACButton from './RBACButton';
@@ -16,8 +14,6 @@ interface LoanDetailsProps {
 }
 
 const LoanDetails: React.FC<LoanDetailsProps> = ({ loan, onBack, onUpdateLoan }) => {
-  const { clients } = useClients();
-  const { refetch: refetchPayments } = usePayments();
   const { canEdit } = useRBAC();
   
   const [editingInstallment, setEditingInstallment] = React.useState<number | null>(null);
@@ -32,24 +28,6 @@ const LoanDetails: React.FC<LoanDetailsProps> = ({ loan, onBack, onUpdateLoan })
   });
   const [isProcessingPayment, setIsProcessingPayment] = React.useState(false);
   const [paymentValidation, setPaymentValidation] = React.useState<{ isValid: boolean; errors: string[] }>({ isValid: true, errors: [] });
-
-  const client = clients.find(c => c.id === loan.clientId);
-  const payments = generateRealTimePayments([loan]);
-  const metrics = calculateCapitalInterestMetrics(loan);
-
-  // Sincronizar pagamentos quando o empréstimo for carregado
-  React.useEffect(() => {
-    const syncPayments = async () => {
-      try {
-        await syncPaymentsFromLoan(loan);
-        await refetchPayments();
-      } catch (error) {
-        console.error('Erro ao sincronizar pagamentos:', error);
-      }
-    };
-
-    syncPayments();
-  }, [loan.id]);
 
   const formatCurrency = (value: number) => {
     return new Intl.NumberFormat('pt-BR', {
@@ -66,6 +44,8 @@ const LoanDetails: React.FC<LoanDetailsProps> = ({ loan, onBack, onUpdateLoan })
   const consolidatedPayments = React.useMemo(() => {
     return generatePaymentsFromLoan(loan);
   }, [loan]);
+
+  const client = mockClients.find(c => c.id === loan.clientId);
 
   // Calcular breakdown das parcelas baseado no installmentPlan
   const installmentBreakdown = React.useMemo(() => {
@@ -195,11 +175,6 @@ const LoanDetails: React.FC<LoanDetailsProps> = ({ loan, onBack, onUpdateLoan })
     // Calcular valor remanescente para esta parcela
     const remainingAmount = installment.remainingAmountForThisInstallment || installment.totalAmount;
     
-    // Calcular multa se vencida
-    const penalty = payment.status === 'overdue' || new Date(payment.dueDate) < new Date()
-      ? calculatePenalty(payment.originalAmount || payment.amount, payment.dueDate)
-      : 0;
-    
     // Pré-preencher com valores proporcionais baseados no valor remanescente
     const proportionalValues = calculateProportionalValues(remainingAmount, installment);
     
@@ -207,8 +182,8 @@ const LoanDetails: React.FC<LoanDetailsProps> = ({ loan, onBack, onUpdateLoan })
       paymentDate: new Date().toISOString().split('T')[0],
       principalPaid: proportionalValues.principalPaid,
       interestPaid: proportionalValues.interestPaid,
-      totalPaid: remainingAmount + penalty,
-      penaltyPaid: penalty
+      totalPaid: remainingAmount,
+      penaltyPaid: payment.penalty || 0
     });
     
     setShowPaymentModal(installmentIndex);
@@ -1084,3 +1059,57 @@ const LoanDetails: React.FC<LoanDetailsProps> = ({ loan, onBack, onUpdateLoan })
                         <span className="font-medium">Pagamento Parcial Detectado</span>
                       </div>
                       <p className="text-yellow-700 text-sm">
+                        A parcela será marcada como <strong>parcialmente paga</strong>. 
+                        Saldo remanescente: <strong>{formatCurrency(remainingAmount - paymentData.totalPaid)}</strong>
+                      </p>
+                    </div>
+                  );
+                } else if (isOverpayment) {
+                  return (
+                    <div className="p-4 bg-purple-50 border border-purple-200 rounded-lg">
+                      <div className="flex items-center gap-2 text-purple-800 mb-2">
+                        <TrendingUp size={16} />
+                        <span className="font-medium">Pagamento a Maior Detectado</span>
+                      </div>
+                      <p className="text-purple-700 text-sm">
+                        Valor excedente: <strong>{formatCurrency(paymentData.totalPaid - remainingAmount)}</strong>
+                        <br />O excedente será registrado no histórico de pagamentos.
+                      </p>
+                    </div>
+                  );
+                }
+                return null;
+              })()}
+            </div>
+            
+            <div className="p-6 border-t border-gray-200 flex justify-end gap-2">
+              <button
+                onClick={() => setShowPaymentModal(null)}
+                className="px-4 py-2 text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50"
+                disabled={isProcessingPayment}
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handlePaymentSubmit}
+                className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center"
+                disabled={!paymentValidation.isValid || isProcessingPayment || paymentData.totalPaid <= 0}
+              >
+                {isProcessingPayment ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
+                    Processando...
+                  </>
+                ) : (
+                  'Confirmar Pagamento'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default LoanDetails;
