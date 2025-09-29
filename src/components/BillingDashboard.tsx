@@ -1,19 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import { Calendar, DollarSign, AlertTriangle, CheckCircle, Clock, Filter, Search, Download, Eye, CreditCard, TrendingUp, TrendingDown, Users, FileText, X, Trash2 } from 'lucide-react';
 import { Loan, Payment, Client } from '../types';
-import { mockLoans, mockClients } from '../data/mockData';
-import { generatePaymentsFromLoan } from '../utils/paymentUtils';
+import { generateRealTimePayments, updatePaymentAndPropagate, calculatePenalty } from '../utils/paymentSync';
 import { useRBAC } from '../hooks/useRBAC';
 import { RBAC_RESOURCES, RBAC_ACTIONS } from '../types/rbac';
 import RBACButton from './RBACButton';
+import { useLoans } from '../hooks/useLoans';
+import { useClients } from '../hooks/useClients';
+import { usePayments } from '../hooks/usePayments';
 
 interface BillingDashboardProps {
   onViewPayment?: (payment: Payment) => void;
   onDeletePayment?: (paymentId: string) => void;
+  onUpdateLoan?: (loan: Loan) => void;
 }
 
-const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDeletePayment }) => {
+const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDeletePayment, onUpdateLoan }) => {
   const { isAdmin } = useRBAC();
+  const { loans, refetch: refetchLoans } = useLoans();
+  const { clients } = useClients();
+  const { payments: supabasePayments, updatePayment, deletePayment: deleteSupabasePayment, refetch: refetchPayments } = usePayments();
   
   const [payments, setPayments] = useState<Payment[]>([]);
   const [filteredPayments, setFilteredPayments] = useState<Payment[]>([]);
@@ -27,20 +33,27 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
   const [showDeleteModal, setShowDeleteModal] = useState<Payment | null>(null);
   const [paymentData, setPaymentData] = useState({
     paymentDate: new Date().toISOString().split('T')[0],
-    capitalPaid: 0,
-    interestPaid: 0,
     totalPaid: 0
   });
 
   useEffect(() => {
-    // Gerar pagamentos a partir dos empréstimos
-    const allPayments: Payment[] = [];
-    mockLoans.forEach(loan => {
-      const loanPayments = generatePaymentsFromLoan(loan);
-      allPayments.push(...loanPayments);
-    });
-    setPayments(allPayments);
-  }, []);
+    // Usar dados do Supabase se disponíveis, senão gerar em tempo real dos empréstimos
+    if (supabasePayments.length > 0) {
+      // Adicionar multas calculadas dinamicamente
+      const paymentsWithPenalties = supabasePayments.map(payment => ({
+        ...payment,
+        penalty: payment.status === 'overdue' || 
+          (payment.status === 'pending' && new Date(payment.dueDate) < new Date())
+          ? calculatePenalty(payment.originalAmount || payment.amount, payment.dueDate)
+          : payment.penalty || 0
+      }));
+      setPayments(paymentsWithPenalties);
+    } else if (loans.length > 0) {
+      // Gerar pagamentos em tempo real a partir dos empréstimos
+      const realTimePayments = generateRealTimePayments(loans);
+      setPayments(realTimePayments);
+    }
+  }, [supabasePayments, loans]);
 
   useEffect(() => {
     let filtered = payments;
@@ -83,8 +96,8 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
     // Filtro por busca
     if (searchTerm) {
       filtered = filtered.filter(payment => {
-        const loan = mockLoans.find(l => l.id === payment.loanId);
-        const client = mockClients.find(c => c.id === loan?.clientId);
+        const loan = loans.find(l => l.id === payment.loanId);
+        const client = clients.find(c => c.id === loan?.clientId);
         return (
           client?.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
           payment.id.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -150,54 +163,74 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
 
   const handleOpenPaymentModal = (payment: Payment) => {
     setShowPaymentModal(payment);
-    // Pré-preencher com valores estimados baseados na parcela
-    const estimatedCapital = payment.principalAmount || (payment.amount * 0.7);
-    const estimatedInterest = payment.interestAmount || (payment.amount * 0.3);
+    
+    // Calcular multa se vencida
+    const penalty = payment.status === 'overdue' || new Date(payment.dueDate) < new Date()
+      ? calculatePenalty(payment.originalAmount || payment.amount, payment.dueDate)
+      : 0;
     
     setPaymentData({
       paymentDate: new Date().toISOString().split('T')[0],
-      capitalPaid: estimatedCapital,
-      interestPaid: estimatedInterest,
-      totalPaid: payment.amount
+      totalPaid: payment.amount + penalty
     });
   };
 
-  const handleConfirmPayment = () => {
+  const handleConfirmPayment = async () => {
     if (!showPaymentModal) return;
 
-    // Registrar o pagamento com detalhamento de capital e juros
-    const paymentRecord = {
-      paymentId: showPaymentModal.id,
-      loanId: showPaymentModal.loanId,
-      installmentNumber: showPaymentModal.installmentNumber,
-      paymentDate: paymentData.paymentDate,
-      capitalPaid: paymentData.capitalPaid,
-      interestPaid: paymentData.interestPaid,
-      totalPaid: paymentData.totalPaid,
-      originalAmount: showPaymentModal.amount,
-      isPartialPayment: paymentData.totalPaid < showPaymentModal.amount,
-      timestamp: new Date().toISOString()
-    };
+    try {
+      // Calcular capital e juros proporcionalmente
+      const originalAmount = showPaymentModal.originalAmount || showPaymentModal.amount;
+      const paymentRatio = paymentData.totalPaid / originalAmount;
+      const capitalPaid = (showPaymentModal.principalAmount || 0) * paymentRatio;
+      const interestPaid = (showPaymentModal.interestAmount || 0) * paymentRatio;
+      const penalty = paymentData.totalPaid - originalAmount > 0 ? 0 : 
+        calculatePenalty(originalAmount, showPaymentModal.dueDate);
 
-    // Salvar no localStorage para tracking (em produção seria banco de dados)
-    const existingRecords = JSON.parse(localStorage.getItem('payment_records') || '[]');
-    existingRecords.push(paymentRecord);
-    localStorage.setItem('payment_records', JSON.stringify(existingRecords));
+      // Usar integração com Supabase se disponível
+      if (supabasePayments.length > 0) {
+        const result = await updatePaymentAndPropagate(
+          showPaymentModal.id,
+          {
+            paymentDate: paymentData.paymentDate,
+            totalPaid: paymentData.totalPaid,
+            capitalPaid,
+            interestPaid,
+            penalty
+          },
+          (updatedLoan) => {
+            if (onUpdateLoan) onUpdateLoan(updatedLoan);
+          }
+        );
 
-    // Atualizar status da parcela
-    handlePaymentUpdate(showPaymentModal.id, 'paid', paymentData.paymentDate);
+        if (!result.success) {
+          alert(`Erro ao processar pagamento: ${result.error}`);
+          return;
+        }
 
-    // Fechar modal e limpar dados
+        // Recarregar dados
+        await refetchPayments();
+        await refetchLoans();
+      } else {
+        // Fallback para dados locais
+        handlePaymentUpdate(showPaymentModal.id, 'paid', paymentData.paymentDate);
+      }
+
+      // Feedback para o usuário
+      const paymentType = paymentData.totalPaid < originalAmount ? 'parcial' :
+                          paymentData.totalPaid > originalAmount ? 'com excesso' : 'integral';
+      
+      alert(`Pagamento ${paymentType} registrado com sucesso!\nCapital: ${formatCurrency(capitalPaid)}\nJuros: ${formatCurrency(interestPaid)}\nTotal: ${formatCurrency(paymentData.totalPaid)}`);
+    } catch (error) {
+      console.error('Erro ao confirmar pagamento:', error);
+      alert('Erro ao processar pagamento. Tente novamente.');
+    }
+
     setShowPaymentModal(null);
     setPaymentData({
       paymentDate: new Date().toISOString().split('T')[0],
-      capitalPaid: 0,
-      interestPaid: 0,
       totalPaid: 0
     });
-
-    // Feedback para o usuário
-    alert(`Pagamento registrado com sucesso!\nCapital: ${formatCurrency(paymentData.capitalPaid)}\nJuros: ${formatCurrency(paymentData.interestPaid)}\nTotal: ${formatCurrency(paymentData.totalPaid)}`);
   };
 
   const handleBulkPayment = () => {
@@ -215,14 +248,23 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
     setShowDeleteModal(payment);
   };
 
-  const confirmDeletePayment = () => {
+  const confirmDeletePayment = async () => {
     if (showDeleteModal) {
-      // Remover pagamento da lista local
-      setPayments(prev => prev.filter(p => p.id !== showDeleteModal.id));
-      
-      // Chamar callback se fornecido
-      if (onDeletePayment) {
-        onDeletePayment(showDeleteModal.id);
+      try {
+        // Usar Supabase se disponível
+        if (supabasePayments.length > 0) {
+          await deleteSupabasePayment(showDeleteModal.id);
+          await refetchPayments();
+        } else {
+          // Fallback para dados locais
+          setPayments(prev => prev.filter(p => p.id !== showDeleteModal.id));
+          if (onDeletePayment) {
+            onDeletePayment(showDeleteModal.id);
+          }
+        }
+      } catch (error) {
+        console.error('Erro ao excluir pagamento:', error);
+        alert('Erro ao excluir pagamento. Tente novamente.');
       }
       
       setShowDeleteModal(null);
@@ -457,8 +499,9 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
             </thead>
             <tbody className="divide-y divide-gray-200">
               {filteredPayments.map((payment) => {
-                const loan = mockLoans.find(l => l.id === payment.loanId);
-                const client = mockClients.find(c => c.id === loan?.clientId);
+                const loan = loans.find(l => l.id === payment.loanId);
+                const client = clients.find(c => c.id === payment.clientId) || 
+                             clients.find(c => c.id === loan?.clientId);
                 const isOverdue = new Date(payment.dueDate) < new Date() && payment.status === 'pending';
                 
                 return (
@@ -473,7 +516,9 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
                     </td>
                     <td className="px-2 sm:px-4 py-2 sm:py-3">
                       <div>
-                        <div className="text-sm sm:text-base font-medium text-gray-900 truncate">{client?.name || 'Cliente não encontrado'}</div>
+                        <div className="text-sm sm:text-base font-medium text-gray-900 truncate">
+                          {payment.clientName || client?.name || 'Cliente não encontrado'}
+                        </div>
                         <div className="text-xs sm:text-sm text-gray-500">Emp. #{loan?.id}</div>
                       </div>
                     </td>
@@ -609,16 +654,16 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
                   <div>
                     <span className="text-gray-600">Cliente:</span>
                     <div className="font-medium">
-                      {(() => {
-                        const loan = mockLoans.find(l => l.id === showPaymentModal.loanId);
-                        const client = mockClients.find(c => c.id === loan?.clientId);
+                      {showPaymentModal.clientName || (() => {
+                        const loan = loans.find(l => l.id === showPaymentModal.loanId);
+                        const client = clients.find(c => c.id === loan?.clientId);
                         return client?.name || 'Cliente não encontrado';
                       })()}
                     </div>
                   </div>
                   <div>
                     <span className="text-gray-600">Valor Original:</span>
-                    <div className="font-medium">{formatCurrency(showPaymentModal.amount)}</div>
+                    <div className="font-medium">{formatCurrency(showPaymentModal.originalAmount || showPaymentModal.amount)}</div>
                   </div>
                   <div>
                     <span className="text-gray-600">Vencimento:</span>
@@ -631,7 +676,7 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
                 </div>
               </div>
 
-              {/* Campos de Pagamento */}
+              {/* Campo de Pagamento Principal */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -653,10 +698,7 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
                   <input
                     type="number"
                     value={paymentData.totalPaid}
-                    onChange={(e) => {
-                      const total = Number(e.target.value);
-                      setPaymentData(prev => ({ ...prev, totalPaid: total }));
-                    }}
+                    onChange={(e) => setPaymentData(prev => ({ ...prev, totalPaid: Number(e.target.value) }))}
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     step="0.01"
                     min="0"
@@ -664,59 +706,7 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
                     required
                   />
                   <div className="text-xs text-gray-500 mt-1">
-                    Valor total efetivamente pago
-                  </div>
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Capital Pago (R$) *
-                  </label>
-                  <input
-                    type="number"
-                    value={paymentData.capitalPaid}
-                    onChange={(e) => {
-                      const capital = Number(e.target.value);
-                      setPaymentData(prev => ({ 
-                        ...prev, 
-                        capitalPaid: capital,
-                        totalPaid: capital + prev.interestPaid
-                      }));
-                    }}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    step="0.01"
-                    min="0"
-                    placeholder="0.00"
-                    required
-                  />
-                  <div className="text-xs text-blue-600 mt-1">
-                    Valor do capital retornado
-                  </div>
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Juros Pagos (R$) *
-                  </label>
-                  <input
-                    type="number"
-                    value={paymentData.interestPaid}
-                    onChange={(e) => {
-                      const interest = Number(e.target.value);
-                      setPaymentData(prev => ({ 
-                        ...prev, 
-                        interestPaid: interest,
-                        totalPaid: prev.capitalPaid + interest
-                      }));
-                    }}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    step="0.01"
-                    min="0"
-                    placeholder="0.00"
-                    required
-                  />
-                  <div className="text-xs text-orange-600 mt-1">
-                    Valor dos juros recebidos
+                    Valor total efetivamente recebido
                   </div>
                 </div>
               </div>
@@ -724,7 +714,206 @@ const BillingDashboard: React.FC<BillingDashboardProps> = ({ onViewPayment, onDe
               {/* Resumo do Pagamento */}
               <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">
                 <h3 className="font-medium text-blue-900 mb-2">Resumo do Pagamento</h3>
-                <div className="grid grid-cols-3 gap-4 text-sm">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
+                  {(() => {
+                    const originalAmount = showPaymentModal.originalAmount || showPaymentModal.amount;
+                    const paymentRatio = paymentData.totalPaid / originalAmount;
+                    const capitalPaid = (showPaymentModal.principalAmount || 0) * paymentRatio;
+                    const interestPaid = (showPaymentModal.interestAmount || 0) * paymentRatio;
+                    const penalty = paymentData.totalPaid > originalAmount ? 0 :
+                      calculatePenalty(originalAmount, showPaymentModal.dueDate);
+                    
+                    return (
+                      <>
+                        <div>
+                          <span className="text-blue-700">Capital:</span>
+                          <div className="font-bold text-blue-800">{formatCurrency(capitalPaid)}</div>
+                        </div>
+                        <div>
+                          <span className="text-orange-700">Juros:</span>
+                          <div className="font-bold text-orange-800">{formatCurrency(interestPaid)}</div>
+                        </div>
+                        <div>
+                          <span className="text-gray-700">Total:</span>
+                          <div className="font-bold text-gray-900">{formatCurrency(paymentData.totalPaid)}</div>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+                
+                {(() => {
+                  const originalAmount = showPaymentModal.originalAmount || showPaymentModal.amount;
+                  const penalty = calculatePenalty(originalAmount, showPaymentModal.dueDate);
+                  
+                  return (
+                    <>
+                      {penalty > 0 && (
+                        <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded">
+                          <div className="text-xs text-red-800">
+                            <strong>Multa por Atraso:</strong> {formatCurrency(penalty)}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {paymentData.totalPaid < originalAmount && (
+                        <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded">
+                          <div className="text-xs text-yellow-800">
+                            <strong>Pagamento Parcial:</strong> Faltam {formatCurrency(originalAmount - paymentData.totalPaid)} para quitar a parcela
+                          </div>
+                        </div>
+                      )}
+                      
+                      {paymentData.totalPaid > originalAmount && (
+                        <div className="mt-2 p-2 bg-green-50 border border-green-200 rounded">
+                          <div className="text-xs text-green-800">
+                            <strong>Pagamento a Maior:</strong> Excesso de {formatCurrency(paymentData.totalPaid - originalAmount)}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+            
+            <div className="p-6 border-t border-gray-200 flex flex-col sm:flex-row justify-end gap-2">
+              <button
+                onClick={() => setShowPaymentModal(null)}
+                className="w-full sm:w-auto px-4 py-2 text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50 touch-manipulation"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleConfirmPayment}
+                className="w-full sm:w-auto px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 touch-manipulation"
+                disabled={!paymentData.paymentDate || paymentData.totalPaid <= 0}
+              >
+                Confirmar Pagamento
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Confirmação de Exclusão de Parcela */}
+      {showDeleteModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl max-w-md w-full mx-4">
+            <div className="p-6">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center">
+                  <AlertTriangle className="text-red-600" size={24} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">Confirmar Exclusão</h3>
+                  <p className="text-gray-600">Esta ação não pode ser desfeita</p>
+                </div>
+              </div>
+              
+              <div className="mb-6">
+                <p className="text-gray-700">
+                  Tem certeza que deseja excluir a parcela <strong>#{showDeleteModal.installmentNumber}</strong>?
+                </p>
+                
+                <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                  <div className="text-sm text-blue-800">
+                    <div><strong>Cliente:</strong> {showDeleteModal.clientName || (() => {
+                      const loan = loans.find(l => l.id === showDeleteModal.loanId);
+                      const client = clients.find(c => c.id === loan?.clientId);
+                      return client?.name || 'Cliente não encontrado';
+                    })()}</div>
+                    <div><strong>Valor:</strong> {formatCurrency(showDeleteModal.amount)}</div>
+                    <div><strong>Vencimento:</strong> {formatDate(showDeleteModal.dueDate)}</div>
+                    <div><strong>Status:</strong> {getStatusText(showDeleteModal.status)}</div>
+                  </div>
+                </div>
+                
+                <div className="mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                  <div className="flex items-center gap-2 text-yellow-800">
+                    <AlertTriangle size={16} />
+                    <span className="font-medium">Atenção</span>
+                  </div>
+                  <p className="text-yellow-700 text-sm mt-1">
+                    A exclusão da parcela afetará o cronograma de pagamentos do empréstimo. 
+                    Esta ação deve ser usada apenas em casos excepcionais.
+                  </p>
+                </div>
+                
+                {showDeleteModal.status === 'paid' && (
+                  <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg">
+                    <div className="flex items-center gap-2 text-red-800">
+                      <AlertTriangle size={16} />
+                      <span className="font-medium">⚠️ ATENÇÃO - Parcela Paga</span>
+                    </div>
+                    <p className="text-red-700 text-sm mt-1">
+                      Esta parcela já foi paga em {showDeleteModal.paymentDate ? formatDate(showDeleteModal.paymentDate) : 'data não informada'}. 
+                      A exclusão afetará permanentemente:
+                    </p>
+                    <ul className="text-red-700 text-sm mt-2 ml-4 list-disc">
+                      <li>Registros financeiros e relatórios</li>
+                      <li>Histórico de pagamentos do cliente</li>
+                      <li>Cálculos de rentabilidade</li>
+                      <li>Métricas de performance</li>
+                    </ul>
+                    <div className="mt-2 p-2 bg-red-100 border border-red-300 rounded">
+                      <div className="text-xs text-red-800 font-medium">
+                        🔒 FUNÇÃO RESTRITA: Apenas administradores podem excluir parcelas pagas
+                      </div>
+                    </div>
+                  </div>
+                )}
+                
+                {!isAdmin && showDeleteModal.status === 'paid' && (
+                  <div className="mt-3 p-3 bg-gray-50 border border-gray-200 rounded-lg">
+                    <div className="flex items-center gap-2 text-gray-800">
+                      <AlertTriangle size={16} />
+                      <span className="font-medium">Acesso Negado</span>
+                    </div>
+                    <p className="text-gray-700 text-sm mt-1">
+                      Apenas administradores podem excluir parcelas que já foram pagas.
+                    </p>
+                  </div>
+                )}
+              </div>
+              
+              <div className="flex flex-col sm:flex-row gap-3">
+                <button
+                  onClick={() => setShowDeleteModal(null)}
+                  className="w-full sm:flex-1 px-4 py-2 text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors touch-manipulation"
+                >
+                  Cancelar
+                </button>
+                <RBACButton
+                  resource={RBAC_RESOURCES.COLLECTIONS}
+                  action={RBAC_ACTIONS.DELETE}
+                  onClick={confirmDeletePayment}
+                  className="w-full sm:flex-1 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
+                  fallback={
+                    <button
+                      disabled
+                      className="w-full sm:flex-1 px-4 py-2 bg-gray-400 text-white rounded-lg cursor-not-allowed touch-manipulation"
+                    >
+                      Sem Permissão
+                    </button>
+                  }
+                >
+                  {showDeleteModal.status === 'paid' 
+                    ? 'Excluir Parcela Paga (Admin)' 
+                    : 'Excluir Parcela'
+                  }
+                </RBACButton>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default BillingDashboard;
+
                   <div>
                     <span className="text-blue-700">Capital:</span>
                     <div className="font-bold text-blue-800">{formatCurrency(paymentData.capitalPaid)}</div>
