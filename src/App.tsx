@@ -25,8 +25,7 @@ import { initializeRBACUsers } from './data/rbacUsers';
 import { calculateClientMetrics, updateClientMetricsInDatabase } from './utils/paymentUtils';
 import { useClients } from './hooks/useClients';
 import { useLoans } from './hooks/useLoans';
-console.log('Supabase URL atual:', import.meta.env.VITE_SUPABASE_URL)
-console.log('Supabase Key atual:', import.meta.env.VITE_SUPABASE_ANON_KEY)
+
 function App() {
   const auth = useAuthProvider();
   const { clients: supabaseClients, updateClient, refetch: refetchClients } = useClients();
