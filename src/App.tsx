@@ -25,7 +25,7 @@ import { initializeRBACUsers } from './data/rbacUsers';
 import { calculateClientMetrics, updateClientMetricsInDatabase } from './utils/paymentUtils';
 import { useClients } from './hooks/useClients';
 import { useLoans } from './hooks/useLoans';
-das
+
 function App() {
   const auth = useAuthProvider();
   const { clients: supabaseClients, updateClient, refetch: refetchClients } = useClients();
