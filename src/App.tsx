@@ -25,6 +25,11 @@ import { initializeRBACUsers } from './data/rbacUsers';
 import { calculateClientMetrics, updateClientMetricsInDatabase } from './utils/paymentUtils';
 import { useClients } from './hooks/useClients';
 import { useLoans } from './hooks/useLoans';
+import { supabase } from './lib/supabase'
+
+supabase.from('clients').select('id,name').limit(1).then(({ data, error }) => {
+  console.log('supabase TEST:', { data, error })
+})
 
 function App() {
   const auth = useAuthProvider();
